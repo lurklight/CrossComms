@@ -1,0 +1,13 @@
+.packages/
+.pip-cache/
+.tmp/
+.node-runtime/
+.piper-runtime/
+.model-cache/
+__pycache__/
+*.pyc
+gamevoice-edge-tts-*.txt
+gamevoice-edge-tts-*.wav
+gamevoice-piper-tts-*.wav
+gamevoice-tts-*/
+tmp*/

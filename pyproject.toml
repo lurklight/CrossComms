@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crosscomms"
+version = "0.1.0"
+description = "Low-latency Windows voice translation app for gaming comms"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+audio = [
+  "sounddevice>=0.4.6",
+  "webrtcvad-wheels>=2.0.14",
+]
+local-stt = [
+  "numpy>=1.26",
+  "faster-whisper>=1.2.1",
+]
+
+[project.scripts]
+crosscomms = "gamevoice.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
