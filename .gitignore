@@ -1,4 +1,6 @@
 .packages/
+.packages-opus/
+.packages-override/
 .pip-cache/
 .tmp/
 .node-runtime/

@@ -1,21 +1,40 @@
 from __future__ import annotations
 
 if __package__ in {None, ""}:
+    import os
     import sys
     from pathlib import Path as _Path
 
     _FILE = _Path(__file__).resolve()
     _SRC_ROOT = _FILE.parents[1]
     _PROJECT_ROOT = _FILE.parents[2]
+    _OVERRIDE_PACKAGES = _PROJECT_ROOT / ".packages-override"
     _PACKAGES = _PROJECT_ROOT / ".packages"
+    _OPUS_PACKAGES = _PROJECT_ROOT / ".packages-opus"
 
-    for _entry in (_PACKAGES, _SRC_ROOT):
-        if _entry.exists() and str(_entry) not in sys.path:
-            sys.path.insert(0, str(_entry))
+    for _entry in reversed((_OVERRIDE_PACKAGES, _OPUS_PACKAGES, _PACKAGES, _SRC_ROOT)):
+        if _entry.exists():
+            _entry_text = str(_entry)
+            if _entry_text in sys.path:
+                sys.path.remove(_entry_text)
+            sys.path.insert(0, _entry_text)
+    _nvidia_root = _PACKAGES / "nvidia"
+    if _nvidia_root.exists():
+        _runtime_dirs = [
+            str(_path)
+            for _path in sorted(_nvidia_root.glob("*/bin"))
+            if _path.exists()
+        ]
+        if _runtime_dirs:
+            _existing_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = os.pathsep.join(
+                _runtime_dirs + ([_existing_path] if _existing_path else [])
+            )
     __package__ = "gamevoice"
 
 import asyncio
 from contextlib import suppress
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import ctypes
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +52,14 @@ from .audio.devices import (
 from .audio.input import EnergyVoiceActivityDetector, SoundDeviceMicrophoneSource
 from .audio.output import NullAudioSink, SoundDeviceVirtualMicSink
 from .config import RuntimeConfig
+from .config import (
+    STT_MODE_CPU_ONLY,
+    STT_MODE_GPU_ONLY,
+    TRANSLATION_MODE_LOCAL_OPUS,
+    TRANSLATION_MODE_WEB,
+    translation_mode_for_label,
+    whisper_runtime_for_mode,
+)
 from .comms.normalizer import GameCommsNormalizer, SlangPack
 from .languages import LanguageOption, load_language_options
 from .models import PipelineEvent, PipelineStage
@@ -42,7 +69,15 @@ from .providers.faster_whisper_recognizer import (
     build_whisper_hotwords,
     default_whisper_model_for_language,
 )
+from .providers.fallback import FallbackTextTranslator
 from .providers.piper_tts import PiperSpeechSynthesizer, list_installed_piper_voices
+from .providers.opus_mt import OpusMtTextTranslator
+from .push_to_talk import (
+    PushToTalkBinding,
+    SUPPORTED_BINDINGS_BY_LABEL,
+    WindowsInputMonitor,
+    default_push_to_talk_binding,
+)
 from .providers.web import FreeWebTextTranslator
 
 
@@ -58,6 +93,9 @@ class PipelineController:
         self._pipeline: RealtimeVoicePipeline | None = None
         self._microphone_source: SoundDeviceMicrophoneSource | None = None
         self._live_capture_task: asyncio.Task | None = None
+        self._recognizer_warmup_task: asyncio.Task | None = None
+        self._push_to_talk_monitor = WindowsInputMonitor()
+        self._push_to_talk_binding: PushToTalkBinding | None = None
         self._running = False
 
     def start(self, config: RuntimeConfig) -> None:
@@ -67,20 +105,53 @@ class PipelineController:
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         future = asyncio.run_coroutine_threadsafe(self._start_pipeline(config), self._loop)
-        future.result(timeout=5)
         self._running = True
+        try:
+            future.result(timeout=15)
+        except FutureTimeoutError as exc:
+            self._abort_startup(future)
+            raise RuntimeError(
+                "CrossComms startup took too long. The app cleaned up the partial "
+                "startup, so press Start again."
+            ) from exc
+        except Exception:
+            self._abort_startup(future)
+            raise
 
     def stop(self) -> None:
         if not self._running or self._loop is None:
             return
         future = asyncio.run_coroutine_threadsafe(self._stop_pipeline(), self._loop)
-        future.result(timeout=5)
+        future.result(timeout=15)
         self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread is not None:
             self._thread.join(timeout=2)
         self._loop = None
         self._thread = None
         self._pipeline = None
+        self._running = False
+
+    def _abort_startup(self, future) -> None:
+        with suppress(Exception):
+            future.cancel()
+        if self._loop is not None:
+            with suppress(Exception):
+                stop_future = asyncio.run_coroutine_threadsafe(
+                    self._stop_pipeline(),
+                    self._loop,
+                )
+                stop_future.result(timeout=5)
+            with suppress(Exception):
+                self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        self._loop = None
+        self._thread = None
+        self._pipeline = None
+        self._microphone_source = None
+        self._live_capture_task = None
+        self._recognizer_warmup_task = None
+        self._push_to_talk_binding = None
         self._running = False
 
     def submit_text(self, text: str, is_final: bool) -> None:
@@ -115,6 +186,10 @@ class PipelineController:
     async def _start_pipeline(self, config: RuntimeConfig) -> None:
         normalizer = GameCommsNormalizer(SlangPack(name="Built-in"))
         sink = self._build_sink(config)
+        translator = self._build_translator(config)
+        validate_runtime = getattr(translator, "validate_runtime", None)
+        if callable(validate_runtime):
+            validate_runtime()
         synthesizer = PiperSpeechSynthesizer(
             sample_rate=config.sample_rate,
             source_voice_model=config.source_voice_model,
@@ -124,39 +199,54 @@ class PipelineController:
         self._pipeline = RealtimeVoicePipeline(
             config=config,
             normalizer=normalizer,
-            translator=FreeWebTextTranslator(),
+            translator=translator,
             synthesizer=synthesizer,
             sink=sink,
             event_handler=self.event_queue.put,
         )
         await self._pipeline.start()
-        self._emit_status(
-            "Using free web translation plus a local Piper voice backend. "
-            f"Source voice: {config.source_voice_model or 'default'} | "
-            f"Target voice: {config.target_voice_model or 'default'}. "
-            "Translation still needs internet, but speech synthesis is now fully local."
-        )
+        self._emit_status(self._translator_status_message(config))
         await self._start_live_capture(config)
 
     async def _stop_pipeline(self) -> None:
+        if self._microphone_source is not None:
+            await self._microphone_source.stop()
+
         if self._live_capture_task is not None:
             self._live_capture_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._live_capture_task
             self._live_capture_task = None
 
-        if self._microphone_source is not None:
-            await self._microphone_source.stop()
-            self._microphone_source = None
+        if self._recognizer_warmup_task is not None:
+            self._recognizer_warmup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._recognizer_warmup_task
+            self._recognizer_warmup_task = None
+
+        self._microphone_source = None
 
         if self._pipeline is None:
+            self._push_to_talk_binding = None
             return
         await self._pipeline.stop()
+        self._push_to_talk_binding = None
 
     async def _start_live_capture(self, config: RuntimeConfig) -> None:
         if config.input_mic_name is None:
             self._emit_status("Live mic capture is off because no input device is selected.")
             return
+        if config.push_to_talk_enabled:
+            if not self._push_to_talk_monitor.is_available():
+                raise RuntimeError("Push-to-talk is only available on Windows.")
+            if config.push_to_talk_key_code is None or not config.push_to_talk_key_label:
+                raise RuntimeError("Set a push-to-talk hotkey before starting.")
+            self._push_to_talk_binding = PushToTalkBinding(
+                code=config.push_to_talk_key_code,
+                label=config.push_to_talk_key_label,
+            )
+        else:
+            self._push_to_talk_binding = None
 
         self._microphone_source = SoundDeviceMicrophoneSource(
             sample_rate=config.input_sample_rate,
@@ -185,18 +275,30 @@ class PipelineController:
             or default_whisper_model_for_language(config.source_language),
             device=config.whisper_device,
             compute_type=config.whisper_compute_type,
+            beam_size=config.whisper_beam_size,
+            best_of=config.whisper_best_of,
             download_root=project_root() / ".model-cache",
             min_average_speech_rms=config.min_average_speech_rms,
             hotwords=build_whisper_hotwords(
                 ["hi", "mid", "rotate b", "rotate a", "one shot", "cracked"]
             ),
         )
-        recognizer.validate_runtime()
+        await asyncio.to_thread(recognizer.ensure_runtime_ready)
         self._emit_status(
             "Live mic capture started with faster-whisper local STT. "
+            f"Mode: {config.stt_mode_label}. "
             f"Model: {recognizer.model_name} on {recognizer.device}/{recognizer.compute_type}. "
-            "The first spoken phrase may pause while the model loads. "
-            "Noise gating is running with stricter background filtering."
+            f"Decode: beam {recognizer.beam_size}, best-of {recognizer.best_of}. "
+            + (
+                f"Hold {self._push_to_talk_binding.label} to talk. "
+                if self._push_to_talk_binding is not None
+                else ""
+            )
+            + "Noise gating is running with stricter background filtering."
+        )
+        self._recognizer_warmup_task = asyncio.create_task(
+            self._warm_recognizer(recognizer),
+            name="live-mic-warmup",
         )
         self._live_capture_task = asyncio.create_task(
             self._forward_live_transcripts(recognizer),
@@ -210,7 +312,12 @@ class PipelineController:
         assert self._pipeline is not None
         assert self._microphone_source is not None
         try:
-            async for transcript in recognizer.transcribe(self._microphone_source.frames()):
+            async for transcript in recognizer.transcribe(
+                self._microphone_source.frames(),
+                transmit_active=self._push_to_talk_active
+                if self._push_to_talk_binding is not None
+                else None,
+            ):
                 await self._pipeline.submit_text(
                     transcript.text,
                     is_final=transcript.is_final,
@@ -220,6 +327,18 @@ class PipelineController:
             raise
         except Exception as exc:
             self._emit_status(f"Live mic capture stopped: {exc}")
+
+    async def _warm_recognizer(
+        self,
+        recognizer: FasterWhisperSegmentRecognizer,
+    ) -> None:
+        try:
+            await asyncio.to_thread(recognizer.warm_up)
+            self._emit_status("Local STT model warmed up and ready.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._emit_status(f"STT warmup skipped: {exc}")
 
     def _build_sink(self, config: RuntimeConfig):
         if not config.virtual_mic_name:
@@ -248,6 +367,39 @@ class PipelineController:
                 message=message,
             )
         )
+
+    def _build_translator(self, config: RuntimeConfig):
+        if config.translation_mode_label == TRANSLATION_MODE_LOCAL_OPUS:
+            return FallbackTextTranslator(
+                primary=OpusMtTextTranslator(
+                    download_root=project_root() / ".model-cache" / "opus-mt",
+                    device=config.whisper_device,
+                ),
+                secondary=FreeWebTextTranslator(),
+            )
+        return FreeWebTextTranslator()
+
+    @staticmethod
+    def _translator_status_message(config: RuntimeConfig) -> str:
+        voice_message = (
+            f"Source voice: {config.source_voice_model or 'default'} | "
+            f"Target voice: {config.target_voice_model or 'default'}."
+        )
+        if config.translation_mode_label == TRANSLATION_MODE_LOCAL_OPUS:
+            return (
+                "Using local OPUS-MT translation plus a local Piper voice backend. "
+                f"{voice_message} "
+                "First use of a new language pair may download the local model. "
+                "If a local pair is missing, CrossComms will fall back to web translation automatically."
+            )
+        return (
+            "Using free web translation plus a local Piper voice backend. "
+            f"{voice_message} "
+            "Translation still needs internet, but speech synthesis is now fully local."
+        )
+
+    def _push_to_talk_active(self) -> bool:
+        return self._push_to_talk_monitor.is_pressed(self._push_to_talk_binding)
 
 
 class TranslatorApp:
@@ -307,6 +459,16 @@ class TranslatorApp:
         self.virtual_mic_name = tk.StringVar(value=default_output_device)
         self.source_voice_name = tk.StringVar(value=default_source_voice)
         self.target_voice_name = tk.StringVar(value=default_target_voice)
+        self.stt_mode = tk.StringVar(value=STT_MODE_CPU_ONLY)
+        self.translation_mode = tk.StringVar(value=TRANSLATION_MODE_WEB)
+        default_ptt_binding = default_push_to_talk_binding()
+        self.mic_mode = tk.StringVar(value="Push-to-Talk")
+        self.push_to_talk_binding = tk.StringVar(value=default_ptt_binding.label)
+        self.push_to_talk_code = default_ptt_binding.code
+        self._input_monitor = WindowsInputMonitor()
+        self._capture_hotkey_after_id: str | None = None
+        self._capture_ignored_codes: set[int] = set()
+        self._capturing_hotkey = False
         self.input_text = tk.StringVar(
             value="he's one shot, cracked, rotating B"
         )
@@ -520,6 +682,72 @@ class TranslatorApp:
             width=30,
             padx=(18, 0),
         )
+
+        row4 = tk.Frame(inner, bg=self.colors["bg_card"])
+        row4.pack(fill="x", pady=(0, 18))
+        self.mic_mode_box = self._create_combo_field(
+            row4,
+            "Mic Mode",
+            self.mic_mode,
+            ["Push-to-Talk", "Always On"],
+            width=18,
+        )
+        self.stt_mode_box = self._create_combo_field(
+            row4,
+            "STT Mode",
+            self.stt_mode,
+            [STT_MODE_CPU_ONLY, STT_MODE_GPU_ONLY],
+            width=14,
+            padx=(18, 0),
+        )
+        self.translation_mode_box = self._create_combo_field(
+            row4,
+            "Translation Mode",
+            self.translation_mode,
+            [TRANSLATION_MODE_WEB, TRANSLATION_MODE_LOCAL_OPUS],
+            width=16,
+            padx=(18, 0),
+        )
+
+        hotkey_section = tk.Frame(row4, bg=self.colors["bg_card"])
+        hotkey_section.pack(side="left", padx=(18, 0))
+        tk.Label(
+            hotkey_section,
+            text="Push-to-Talk Hotkey",
+            font=("Segoe UI", 9),
+            fg=self.colors["text_secondary"],
+            bg=self.colors["bg_card"],
+        ).pack(anchor="w", pady=(0, 6))
+
+        hotkey_row = tk.Frame(hotkey_section, bg=self.colors["bg_card"])
+        hotkey_row.pack(anchor="w")
+        self.push_to_talk_label = tk.Label(
+            hotkey_row,
+            textvariable=self.push_to_talk_binding,
+            font=("Segoe UI", 10),
+            fg=self.colors["text_primary"],
+            bg=self.colors["bg_input"],
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+            padx=14,
+            pady=8,
+            width=18,
+            anchor="w",
+        )
+        self.push_to_talk_label.pack(side="left")
+        self.record_hotkey_button = self._create_button(
+            hotkey_row,
+            "Record Hotkey",
+            self._toggle_hotkey_capture,
+        )
+        self.record_hotkey_button.pack(side="left", padx=(10, 0))
+        self.clear_hotkey_button = self._create_button(
+            hotkey_row,
+            "Clear",
+            self._clear_hotkey_binding,
+        )
+        self.clear_hotkey_button.pack(side="left", padx=(10, 0))
 
         button_row = tk.Frame(inner, bg=self.colors["bg_card"])
         button_row.pack(fill="x")
@@ -849,6 +1077,9 @@ class TranslatorApp:
         target_language = self._selected_language_option(self.target_language.get())
         source_voice_model = self.source_voice_map.get(self.source_voice_name.get().strip())
         target_voice_model = self.target_voice_map.get(self.target_voice_name.get().strip())
+        whisper_device, whisper_compute_type = whisper_runtime_for_mode(
+            self.stt_mode.get()
+        )
         return RuntimeConfig(
             source_language=source_language.code if source_language is not None else "en",
             target_language=target_language.code if target_language is not None else "es",
@@ -858,6 +1089,13 @@ class TranslatorApp:
             virtual_mic_name=output_choice.index if output_choice is not None else None,
             source_voice_model=source_voice_model,
             target_voice_model=target_voice_model,
+            whisper_device=whisper_device,
+            whisper_compute_type=whisper_compute_type,
+            stt_mode_label=self.stt_mode.get().strip() or STT_MODE_CPU_ONLY,
+            translation_mode_label=translation_mode_for_label(self.translation_mode.get()),
+            push_to_talk_enabled=self.mic_mode.get() == "Push-to-Talk",
+            push_to_talk_key_code=self.push_to_talk_code,
+            push_to_talk_key_label=self.push_to_talk_binding.get().strip(),
         )
 
     def _start_pipeline(self) -> None:
@@ -927,6 +1165,49 @@ class TranslatorApp:
             )
         )
         self._append_log("Refreshed languages, voices, and audio devices.")
+
+    def _toggle_hotkey_capture(self) -> None:
+        if self._capturing_hotkey:
+            self._stop_hotkey_capture(cancelled=True)
+            return
+        if not self._input_monitor.is_available():
+            messagebox.showerror(
+                "Push-to-talk unavailable",
+                "Global push-to-talk recording only works on Windows.",
+            )
+            return
+        self._capturing_hotkey = True
+        self._capture_ignored_codes = self._input_monitor.pressed_codes()
+        self.record_hotkey_button.config(text="Press Any Key/Button...")
+        self._append_log("Push-to-talk hotkey capture started.")
+        self._poll_hotkey_capture()
+
+    def _poll_hotkey_capture(self) -> None:
+        if not self._capturing_hotkey:
+            return
+        binding = self._input_monitor.capture_new_binding(self._capture_ignored_codes)
+        if binding is not None:
+            self.push_to_talk_binding.set(binding.label)
+            self.push_to_talk_code = binding.code
+            self._append_log(f"Push-to-talk hotkey set to {binding.label}.")
+            self._stop_hotkey_capture(cancelled=False)
+            return
+        self._capture_hotkey_after_id = self.root.after(40, self._poll_hotkey_capture)
+
+    def _stop_hotkey_capture(self, cancelled: bool) -> None:
+        self._capturing_hotkey = False
+        if self._capture_hotkey_after_id is not None:
+            self.root.after_cancel(self._capture_hotkey_after_id)
+            self._capture_hotkey_after_id = None
+        self._capture_ignored_codes.clear()
+        self.record_hotkey_button.config(text="Record Hotkey")
+        if cancelled:
+            self._append_log("Push-to-talk hotkey capture cancelled.")
+
+    def _clear_hotkey_binding(self) -> None:
+        self.push_to_talk_binding.set("Not Set")
+        self.push_to_talk_code = None
+        self._append_log("Cleared push-to-talk hotkey.")
 
     def _poll_events(self) -> None:
         try:
@@ -1149,6 +1430,8 @@ class TranslatorApp:
             )
 
     def _on_close(self) -> None:
+        if self._capturing_hotkey:
+            self._stop_hotkey_capture(cancelled=True)
         if self.controller is not None:
             try:
                 self.controller.stop()

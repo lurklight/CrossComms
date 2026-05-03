@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 import json
 from typing import Any
@@ -24,8 +25,11 @@ class FreeWebTextTranslator:
     def __init__(
         self,
         timeout_s: float = 8.0,
+        cache_size: int = 256,
     ) -> None:
         self.timeout_s = timeout_s
+        self.cache_size = max(1, int(cache_size))
+        self._cache: OrderedDict[tuple[str, str, str], str] = OrderedDict()
 
     async def stream_translate(
         self,
@@ -72,6 +76,15 @@ class FreeWebTextTranslator:
             return text
         if source_language.strip().lower() == target_language.strip().lower():
             return text
+        cache_key = (
+            source_language.strip().lower() or "auto",
+            target_language.strip().lower(),
+            cleaned,
+        )
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            self._cache.move_to_end(cache_key)
+            return cached
 
         request = Request(
             "https://translate.googleapis.com/translate_a/single?"
@@ -89,7 +102,12 @@ class FreeWebTextTranslator:
         with urlopen(request, timeout=self.timeout_s) as response:
             payload = json.loads(response.read().decode("utf-8"))
         translated = self._extract_translation(payload)
-        return translated or text
+        resolved = translated or text
+        self._cache[cache_key] = resolved
+        self._cache.move_to_end(cache_key)
+        while len(self._cache) > self.cache_size:
+            self._cache.popitem(last=False)
+        return resolved
 
     @staticmethod
     def _extract_translation(payload: Any) -> str:

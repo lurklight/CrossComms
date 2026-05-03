@@ -105,6 +105,28 @@ class FasterWhisperRecognizerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(results, [])
 
+    async def test_recognizer_flushes_when_push_to_talk_is_released(self) -> None:
+        recognizer = TestRecognizer()
+        active_states = iter([True, True, True, False])
+
+        async def frames() -> AsyncIterator[AudioFrame]:
+            for frame in [
+                _frame(True),
+                _frame(True),
+                _frame(True),
+                _frame(False),
+            ]:
+                yield frame
+
+        results = []
+        async for transcript in recognizer.transcribe(
+            frames(),
+            transmit_active=lambda: next(active_states),
+        ):
+            results.append(transcript.text)
+
+        self.assertEqual(results, ["enemy low"])
+
     def test_repeated_filler_transcript_is_rejected(self) -> None:
         recognizer = TestRecognizer()
         utterance = CapturedUtterance(
@@ -139,6 +161,22 @@ class FasterWhisperRecognizerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(
             recognizer._is_transcript_usable(utterance, "hi", [segment])
+        )
+
+    def test_cuda_error_message_mentions_missing_cublas(self) -> None:
+        message = FasterWhisperSegmentRecognizer._friendly_cuda_runtime_error(
+            "Library cublas64_12.dll is not found or cannot be loaded"
+        )
+
+        self.assertIn("cublas64_12.dll", message)
+        self.assertIn("GPU Only mode", message)
+
+    def test_repetitive_loop_is_collapsed_before_use(self) -> None:
+        self.assertEqual(
+            FasterWhisperSegmentRecognizer._sanitize_transcript_text(
+                "testing, testing, testing, testing, testing, testing"
+            ),
+            "testing testing",
         )
 
 

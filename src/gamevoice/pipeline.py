@@ -172,12 +172,13 @@ class RealtimeVoicePipeline:
             try:
                 try:
                     async for speech in self.synthesizer.stream_speech(translated):
-                        self._emit(
-                            PipelineStage.SYNTHESIZED,
-                            translated.sequence_id,
-                            f"Synthesized audio for: {speech.text}",
-                            speech,
-                        )
+                        if speech.is_final:
+                            self._emit(
+                                PipelineStage.SYNTHESIZED,
+                                translated.sequence_id,
+                                f"Synthesized audio for: {speech.text}",
+                                speech,
+                            )
                         await self._speech_queue.put(speech)
                 except Exception as exc:
                     self._emit(
@@ -193,12 +194,13 @@ class RealtimeVoicePipeline:
             speech = await self._speech_queue.get()
             try:
                 await self.sink.write(speech)
-                self._emit(
-                    PipelineStage.OUTPUT,
-                    speech.sequence_id,
-                    f"Sent audio to output for: {speech.text}",
-                    speech,
-                )
+                if speech.is_final:
+                    self._emit(
+                        PipelineStage.OUTPUT,
+                        speech.sequence_id,
+                        f"Sent audio to output for: {speech.text}",
+                        speech,
+                    )
             finally:
                 self._speech_queue.task_done()
 

@@ -22,11 +22,11 @@ class UtteranceSegmenter:
     def __init__(
         self,
         frame_ms: int,
-        endpoint_silence_ms: int = 420,
-        min_speech_ms: int = 240,
+        endpoint_silence_ms: int = 160,
+        min_speech_ms: int = 180,
         max_utterance_ms: int = 4_500,
-        pre_roll_frames: int = 4,
-        speech_trigger_ms: int = 90,
+        pre_roll_frames: int = 6,
+        speech_trigger_ms: int = 60,
         min_speech_ratio: float = 0.38,
         min_peak_rms: float = 420.0,
     ) -> None:
@@ -98,7 +98,11 @@ class UtteranceSegmenter:
         return self._finalize()
 
     def _finalize(self) -> CapturedUtterance | None:
-        utterance = None
+        utterance = self._captured_utterance_from_active_frames()
+        self._reset_state()
+        return utterance
+
+    def _captured_utterance_from_active_frames(self) -> CapturedUtterance | None:
         total_frames = len(self._active_frames)
         speech_ratio = (
             self._speech_frame_count / total_frames if total_frames else 0.0
@@ -113,7 +117,7 @@ class UtteranceSegmenter:
             and speech_ratio >= self._min_speech_ratio
             and self._peak_rms >= self._min_peak_rms
         ):
-            utterance = CapturedUtterance(
+            return CapturedUtterance(
                 pcm16=b"".join(frame.pcm16 for frame in self._active_frames),
                 sample_rate=self._sample_rate,
                 channels=self._channels,
@@ -123,7 +127,9 @@ class UtteranceSegmenter:
                 average_speech_rms=average_speech_rms,
                 peak_rms=self._peak_rms,
             )
+        return None
 
+    def _reset_state(self) -> None:
         self._pre_roll.clear()
         self._active_frames = []
         self._speaking = False
@@ -132,4 +138,3 @@ class UtteranceSegmenter:
         self._speech_rms_sum = 0.0
         self._peak_rms = 0.0
         self._trailing_silence_frames = 0
-        return utterance

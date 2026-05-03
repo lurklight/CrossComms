@@ -68,6 +68,32 @@ class FreeWebTextTranslatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results, ["hola amigo"])
         self.assertEqual(mocked_urlopen.call_count, 1)
 
+    async def test_translator_reuses_cached_result_for_repeat_phrase(self) -> None:
+        translator = FreeWebTextTranslator()
+        chunk = NormalizedChunk(
+            source_text="need ammo",
+            normalized_text="need ammo",
+            sequence_id=1,
+            is_final=True,
+        )
+
+        with patch(
+            "gamevoice.providers.web.urlopen",
+            return_value=_FakeResponse(b'[[["necesito municion","need ammo",null,null,1]]]'),
+        ) as mocked_urlopen:
+            first = [
+                translated.translated_text
+                async for translated in translator.stream_translate(chunk, "en", "es")
+            ]
+            second = [
+                translated.translated_text
+                async for translated in translator.stream_translate(chunk, "en", "es")
+            ]
+
+        self.assertEqual(first, ["necesito municion"])
+        self.assertEqual(second, ["necesito municion"])
+        self.assertEqual(mocked_urlopen.call_count, 1)
+
 
 class EdgeNeuralSpeechSynthesizerTests(unittest.TestCase):
     def test_read_wave_file_returns_sample_rate_and_pcm(self) -> None:
@@ -249,6 +275,89 @@ class PiperSpeechSynthesizerTests(unittest.TestCase):
                 synthesizer._choose_model_path(chunk).name,
                 "pt_BR-faber-medium.onnx",
             )
+
+    def test_synthesizer_reuses_cached_audio_for_repeat_phrase(self) -> None:
+        synthesizer = PiperSpeechSynthesizer(
+            runtime_root=ROOT / "fake-piper-runtime",
+            model_map={
+                "en": "en_US-lessac-high.onnx",
+                "es": "es_MX-claude-high.onnx",
+            },
+        )
+        chunk = TranslationChunk(
+            source_text="hi",
+            translated_text="hola",
+            source_language="en",
+            target_language="es",
+            sequence_id=1,
+            is_final=True,
+        )
+
+        with patch("pathlib.Path.exists", return_value=True), patch(
+            "gamevoice.providers.piper_tts.subprocess.run"
+        ) as mocked_run, patch.object(
+            PiperSpeechSynthesizer,
+            "_read_wave_file",
+            return_value=(22_050, b"\x20\x00" * 128),
+        ):
+            mocked_run.return_value.returncode = 0
+            mocked_run.return_value.stderr = ""
+            mocked_run.return_value.stdout = ""
+
+            first_rate, first_pcm16 = synthesizer._synthesize_sync(chunk)
+            second_rate, second_pcm16 = synthesizer._synthesize_sync(chunk)
+
+        self.assertEqual(mocked_run.call_count, 1)
+        self.assertEqual(first_rate, second_rate)
+        self.assertEqual(first_pcm16, second_pcm16)
+
+    def test_model_sample_rate_reads_voice_json(self) -> None:
+        runtime_root = ROOT / "fake-piper-runtime"
+        voice_dir = runtime_root / "voices"
+        voice_dir.mkdir(parents=True, exist_ok=True)
+        model_path = voice_dir / "es_ES-davefx-medium.onnx"
+        config_path = voice_dir / "es_ES-davefx-medium.onnx.json"
+        try:
+            model_path.write_bytes(b"")
+            config_path.write_text('{"audio":{"sample_rate":22050}}', encoding="utf-8")
+            synthesizer = PiperSpeechSynthesizer(runtime_root=runtime_root)
+            self.assertEqual(synthesizer._model_sample_rate(model_path), 22_050)
+        finally:
+            config_path.unlink(missing_ok=True)
+            model_path.unlink(missing_ok=True)
+            voice_dir.rmdir()
+            runtime_root.rmdir()
+
+
+class PiperSpeechSynthesizerAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stream_speech_uses_cached_audio_without_spawning(self) -> None:
+        synthesizer = PiperSpeechSynthesizer(runtime_root=ROOT / "fake-piper-runtime")
+        model_path = ROOT / "fake-piper-runtime" / "voices" / "es_MX-claude-high.onnx"
+        chunk = TranslationChunk(
+            source_text="hi",
+            translated_text="hola",
+            source_language="en",
+            target_language="es",
+            sequence_id=1,
+            is_final=True,
+        )
+        synthesizer._cache[(str(model_path), "hola", synthesizer.sample_rate)] = (
+            synthesizer.sample_rate,
+            b"\x20\x00" * 64,
+        )
+
+        with patch.object(
+            PiperSpeechSynthesizer,
+            "_choose_model_path",
+            return_value=model_path,
+        ), patch(
+            "asyncio.create_subprocess_exec"
+        ) as mocked_exec:
+            chunks = [speech async for speech in synthesizer.stream_speech(chunk)]
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].pcm16, b"\x20\x00" * 64)
+        mocked_exec.assert_not_called()
 
 
 if __name__ == "__main__":

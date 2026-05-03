@@ -1,7 +1,8 @@
 param(
     [switch]$SkipPythonDeps,
     [switch]$SkipPiper,
-    [switch]$SkipVoices
+    [switch]$SkipVoices,
+    [switch]$InstallGpuDeps
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,6 +10,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $src = Join-Path $root "src"
 $packages = Join-Path $root ".packages"
+$opusPackages = Join-Path $root ".packages-opus"
 $pipCache = Join-Path $root ".pip-cache"
 $tmpRoot = Join-Path $root ".tmp"
 $modelCache = Join-Path $root ".model-cache"
@@ -22,6 +24,16 @@ $pythonDeps = @(
     "webrtcvad-wheels>=2.0.14",
     "numpy>=1.26",
     "faster-whisper>=1.2.1"
+)
+
+$opusPythonDeps = @(
+    "huggingface-hub>=1.13.0",
+    "sentencepiece>=0.2.0"
+)
+
+$gpuPythonDeps = @(
+    "nvidia-cublas-cu12",
+    "nvidia-cudnn-cu12"
 )
 
 $voiceDownloads = @(
@@ -64,6 +76,7 @@ if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
 }
 
 New-Item -ItemType Directory -Force -Path $packages | Out-Null
+New-Item -ItemType Directory -Force -Path $opusPackages | Out-Null
 New-Item -ItemType Directory -Force -Path $pipCache | Out-Null
 New-Item -ItemType Directory -Force -Path $tmpRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $modelCache | Out-Null
@@ -80,9 +93,23 @@ if (-not $SkipPythonDeps) {
     if ($LASTEXITCODE -ne 0) {
         throw "Python dependency install failed."
     }
+
+    Write-Step "Installing local OPUS translation dependencies into .packages-opus"
+    & python -m pip install --disable-pip-version-check --upgrade --target $opusPackages $opusPythonDeps
+    if ($LASTEXITCODE -ne 0) {
+        throw "OPUS translation dependency install failed."
+    }
 }
 else {
     Write-Step "Skipping Python dependency install"
+}
+
+if ($InstallGpuDeps) {
+    Write-Step "Installing optional GPU runtime dependencies into .packages"
+    & python -m pip install --disable-pip-version-check --upgrade --target $packages $gpuPythonDeps
+    if ($LASTEXITCODE -ne 0) {
+        throw "GPU runtime dependency install failed."
+    }
 }
 
 if (-not $SkipPiper) {
@@ -121,6 +148,11 @@ $expectedPythonArtifacts = @(
     (Join-Path $packages "faster_whisper")
 )
 
+$expectedOpusArtifacts = @(
+    (Join-Path $opusPackages "huggingface_hub"),
+    (Join-Path $opusPackages "sentencepiece")
+)
+
 $expectedVoiceArtifacts = $voiceDownloads | ForEach-Object {
     Join-Path $voicesDir $_.File
 }
@@ -129,6 +161,13 @@ Write-Step "Verifying local dependency files"
 foreach ($artifact in $expectedPythonArtifacts) {
     if (-not (Test-Path -LiteralPath $artifact)) {
         throw "Missing expected dependency artifact: $artifact"
+    }
+}
+
+Write-Step "Verifying local OPUS translation dependency files"
+foreach ($artifact in $expectedOpusArtifacts) {
+    if (-not (Test-Path -LiteralPath $artifact)) {
+        throw "Missing expected OPUS dependency artifact: $artifact"
     }
 }
 
@@ -143,6 +182,7 @@ $voiceCount = @(Get-ChildItem -LiteralPath $voicesDir -Filter *.onnx -ErrorActio
 
 Write-Step "Setup complete"
 Write-Host "Local packages: $packages"
+Write-Host "OPUS packages:  $opusPackages"
 Write-Host "Piper runtime:  $piperRoot"
 Write-Host "Voice files:    $voiceCount detected in .piper-runtime\\voices"
 
@@ -154,3 +194,7 @@ if ($voiceCount -eq 0) {
 
 Write-Host ""
 Write-Host "Next step: pythonw CrossComms.pyw" -ForegroundColor Green
+if (-not $InstallGpuDeps) {
+    Write-Host "Optional GPU STT support: .\\setup.ps1 -InstallGpuDeps" -ForegroundColor DarkGray
+}
+Write-Host "Local OPUS translation models download automatically the first time a language pair is used." -ForegroundColor DarkGray

@@ -6,7 +6,7 @@
 
 - Captures your microphone live
 - Transcribes your speech with local `faster-whisper`
-- Translates the text
+- Translates the text with either `Web` mode or `Local OPUS` mode
 - Speaks the translated result with local Piper voices
 - Routes the translated voice into a virtual mic such as `VB-CABLE`
 
@@ -18,11 +18,11 @@ Before you run CrossComms, make sure you have:
 - `Python 3.11+` installed and available on `PATH`
 - `VB-CABLE` installed if you want the translated voice to appear as a microphone in Discord or games
 - a working microphone
-- internet access for the translation step
+- internet access for `Web` translation and for first-time `Local OPUS` model downloads
 
 Important:
 
-- The app setup script installs the Python packages, Piper runtime, and default Piper voices for you
+- The app setup script installs the Python packages, local OPUS helper package, Piper runtime, and default Piper voices for you
 - The app does not install `Python` or `VB-CABLE` for you
 
 ## Setup Checklist
@@ -59,6 +59,7 @@ CrossComms.pyw
 The setup script downloads and installs:
 
 - local Python dependencies into `.packages`
+- local OPUS translation helper dependencies into `.packages-opus`
 - Piper runtime into `.piper-runtime\piper`
 - the default Piper voice set into `.piper-runtime\voices`
 
@@ -105,6 +106,25 @@ After launch:
 
 If you just want to test without talking, use the `Manual Test` section in the app.
 
+## Translation Modes
+
+CrossComms currently has two translation modes:
+
+- `Web`
+  Uses the online translation backend. This is the most broadly compatible mode right now.
+- `Local OPUS`
+  Uses local OPUS/CTranslate2 models first. If a local pair is missing, CrossComms automatically falls back to the web translator instead of echoing your English back.
+
+Current `Local OPUS` target coverage that I verified:
+
+- local-first working: `es`, `fr`, `de`, `it`, `ru`, `vi`, `zh-CN`
+- web fallback currently used: `pt`, `pt-BR`
+
+So if you want the safest setup today, use:
+
+- `GPU Only + Local OPUS` for the fastest local-first path
+- `GPU Only + Web` if you want the broadest compatibility
+
 ## Supported Languages
 
 Current built-in language list:
@@ -148,7 +168,8 @@ This build works, but it is still an MVP.
 
 Current limitations:
 
-- translation still needs internet
+- some `Local OPUS` language pairs still fall back to `Web`
+- first use of a `Local OPUS` pair may pause while its model downloads
 - latency is not fully optimized yet
 - it is not fully streaming end-to-end yet
 - mic sensitivity is not exposed as a simple UI slider yet
